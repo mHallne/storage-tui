@@ -1,0 +1,16 @@
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+storage-tui
+
+# Test binary
+*.test
+
+# Output of the go coverage tool
+*.out
+
+# Build output
+/bin/
