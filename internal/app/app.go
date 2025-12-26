@@ -17,6 +17,7 @@ type itemKind int
 const (
 	kindRoot itemKind = iota
 	kindNone
+	kindSubscription
 	kindAccount
 	kindContainer
 	kindBlob
@@ -31,39 +32,42 @@ const (
 )
 
 type itemRef struct {
-	Kind         itemKind
-	Name         string
-	Account      string
-	Container    string
-	Region       string
-	PublicAccess string
-	SizeBytes    int64
-	Modified     time.Time
-	ContentType  string
+	Kind             itemKind
+	Name             string
+	SubscriptionID   string
+	SubscriptionName string
+	Account          string
+	Container        string
+	Region           string
+	PublicAccess     string
+	SizeBytes        int64
+	Modified         time.Time
+	ContentType      string
 }
 
 type App struct {
-	provider          azure.Provider
-	app               *tview.Application
-	pages             *tview.Pages
-	accounts          *tview.TreeView
-	contents          *tview.Table
-	preview           *tview.TextView
-	details           *tview.TextView
-	searchForm        *tview.Form
-	searchInput       *tview.InputField
-	searchOpen        bool
-	root              *tview.TreeNode
-	rootRef           itemRef
-	contentRefs       []itemRef
-	activePane        pane
-	loadingAccounts   bool
-	loadingContents   bool
-	lastDetails       string
-	lastPreview       string
-	previewFull       string
-	previewSearch     string
-	previewSearchable bool
+	provider            azure.Provider
+	app                 *tview.Application
+	pages               *tview.Pages
+	accounts            *tview.TreeView
+	contents            *tview.Table
+	preview             *tview.TextView
+	details             *tview.TextView
+	searchForm          *tview.Form
+	searchInput         *tview.InputField
+	searchOpen          bool
+	root                *tview.TreeNode
+	rootRef             itemRef
+	contentRefs         []itemRef
+	activePane          pane
+	loadingTree         bool
+	loadingContents     bool
+	lastDetails         string
+	lastPreview         string
+	previewFull         string
+	previewSearch       string
+	previewSearchable   bool
+	subscriptionEnabled map[string]bool
 }
 
 func New(provider azure.Provider) *App {
@@ -76,16 +80,16 @@ func New(provider azure.Provider) *App {
 
 	header := tview.NewTextView().
 		SetTextAlign(tview.AlignCenter).
-		SetText("Azure Storage Explorer TUI  q: quit | r: refresh | tab: switch pane | enter: expand | /: search | esc: clear search")
+		SetText("Azure Storage Explorer TUI  q: quit | r: refresh | tab: switch pane | enter/right: expand or collapse | left: parent or collapse | space: toggle subscription | /: search | esc: clear search")
 
-	rootRef := itemRef{Kind: kindRoot, Name: "Storage Accounts"}
+	rootRef := itemRef{Kind: kindRoot, Name: "Subscriptions"}
 	root := tview.NewTreeNode(rootRef.Name).
 		SetReference(rootRef).
 		SetSelectable(false).
 		SetExpanded(true)
 
 	accounts.SetRoot(root).SetCurrentNode(root)
-	accounts.SetBorder(true).SetTitle("Accounts")
+	accounts.SetBorder(true).SetTitle("Subscriptions")
 	contents.SetBorder(true).SetTitle("Contents")
 	contents.SetSelectable(true, false)
 	preview.SetBorder(true).SetTitle("Preview")
@@ -95,37 +99,59 @@ func New(provider azure.Provider) *App {
 	details.SetBorder(true).SetTitle("Details")
 
 	a := &App{
-		provider:    provider,
-		app:         application,
-		pages:       pages,
-		accounts:    accounts,
-		contents:    contents,
-		preview:     preview,
-		details:     details,
-		root:        root,
-		rootRef:     rootRef,
-		activePane:  paneAccounts,
-		contentRefs: nil,
+		provider:            provider,
+		app:                 application,
+		pages:               pages,
+		accounts:            accounts,
+		contents:            contents,
+		preview:             preview,
+		details:             details,
+		root:                root,
+		rootRef:             rootRef,
+		activePane:          paneAccounts,
+		contentRefs:         nil,
+		subscriptionEnabled: make(map[string]bool),
 	}
 
 	a.accounts.SetChangedFunc(func(node *tview.TreeNode) {
-		if a.loadingAccounts {
+		if a.loadingTree {
 			return
 		}
 		a.onTreeChanged(node)
 	})
 
 	a.accounts.SetSelectedFunc(func(node *tview.TreeNode) {
-		if a.loadingAccounts {
+		if a.loadingTree {
 			return
 		}
 		a.onTreeSelected(node)
 	})
 
 	a.accounts.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		if event.Key() == tcell.KeyRight {
-			a.expandTreeNode(a.accounts.GetCurrentNode(), false)
+		switch event.Key() {
+		case tcell.KeyRight:
+			a.expandTreeNode(a.accounts.GetCurrentNode(), true)
 			return nil
+		case tcell.KeyLeft:
+			node := a.accounts.GetCurrentNode()
+			if node == nil {
+				return nil
+			}
+			if node.IsExpanded() && len(node.GetChildren()) > 0 {
+				node.SetExpanded(false)
+				return nil
+			}
+			parent := a.parentNode(node)
+			if parent != nil {
+				a.accounts.SetCurrentNode(parent)
+			}
+			return nil
+		case tcell.KeyRune:
+			if event.Rune() == ' ' {
+				if a.toggleSelectedSubscription() {
+					return nil
+				}
+			}
 		}
 		return event
 	})
@@ -209,8 +235,8 @@ func (a *App) Run() error {
 }
 
 func (a *App) reload() {
-	if err := a.loadAccounts(); err != nil {
-		a.showAccountsError(err)
+	if err := a.loadSubscriptions(); err != nil {
+		a.showSubscriptionsError(err)
 		return
 	}
 	a.showEmptyContents("Select a container to view blobs.")
@@ -300,35 +326,43 @@ func (a *App) setActivePane(target pane) {
 	a.refreshDetails()
 }
 
-func (a *App) loadAccounts() error {
+func (a *App) loadSubscriptions() error {
 	ctx := context.Background()
-	accounts, err := a.provider.ListAccounts(ctx)
+	subscriptions, err := a.provider.ListSubscriptions(ctx)
 	if err != nil {
 		return err
 	}
 
-	a.loadingAccounts = true
+	a.loadingTree = true
 	a.root.ClearChildren()
 	a.root.SetExpanded(true)
-	a.accounts.SetTitle("Accounts")
+	a.accounts.SetTitle("Subscriptions")
+	a.subscriptionEnabled = a.mergeSubscriptionSelections(subscriptions)
 
-	if len(accounts) == 0 {
-		ref := itemRef{Kind: kindNone, Name: "No accounts found."}
+	if len(subscriptions) == 0 {
+		ref := itemRef{Kind: kindNone, Name: "No subscriptions found."}
 		node := tview.NewTreeNode(ref.Name).SetReference(ref).SetSelectable(true)
 		a.root.AddChild(node)
 		a.accounts.SetCurrentNode(node)
-		a.loadingAccounts = false
+		a.loadingTree = false
 		return nil
 	}
 
-	for _, account := range accounts {
+	for _, subscription := range subscriptions {
+		enabled := a.isSubscriptionEnabled(subscription.ID)
 		ref := itemRef{
-			Kind:    kindAccount,
-			Name:    account.Name,
-			Account: account.Name,
-			Region:  account.Region,
+			Kind:             kindSubscription,
+			Name:             subscription.Name,
+			SubscriptionID:   subscription.ID,
+			SubscriptionName: subscription.Name,
 		}
-		node := tview.NewTreeNode(account.Name).SetReference(ref).SetSelectable(true)
+		node := tview.NewTreeNode(subscriptionLabel(ref.Name, enabled)).SetReference(ref).SetSelectable(true)
+		if enabled {
+			if err := a.loadAccountsForSubscription(node, ref); err != nil {
+				return err
+			}
+			node.SetExpanded(true)
+		}
 		a.root.AddChild(node)
 	}
 
@@ -338,7 +372,122 @@ func (a *App) loadAccounts() error {
 	} else {
 		a.accounts.SetCurrentNode(a.root)
 	}
-	a.loadingAccounts = false
+	a.loadingTree = false
+
+	return nil
+}
+
+func (a *App) mergeSubscriptionSelections(subscriptions []azure.Subscription) map[string]bool {
+	next := make(map[string]bool, len(subscriptions))
+	for _, subscription := range subscriptions {
+		enabled, ok := a.subscriptionEnabled[subscription.ID]
+		if !ok {
+			enabled = true
+		}
+		next[subscription.ID] = enabled
+	}
+	return next
+}
+
+func subscriptionLabel(name string, enabled bool) string {
+	if enabled {
+		return fmt.Sprintf("(x) %s", name)
+	}
+	return fmt.Sprintf("( ) %s", name)
+}
+
+func (a *App) isSubscriptionEnabled(subscriptionID string) bool {
+	if subscriptionID == "" {
+		return true
+	}
+	enabled, ok := a.subscriptionEnabled[subscriptionID]
+	if !ok {
+		return true
+	}
+	return enabled
+}
+
+func (a *App) toggleSelectedSubscription() bool {
+	node := a.accounts.GetCurrentNode()
+	if node == nil {
+		return false
+	}
+	ref, ok := node.GetReference().(itemRef)
+	if !ok || ref.Kind != kindSubscription {
+		return false
+	}
+	a.toggleSubscription(node, ref)
+	return true
+}
+
+func (a *App) toggleSubscription(node *tview.TreeNode, subscription itemRef) {
+	enabled := a.isSubscriptionEnabled(subscription.SubscriptionID)
+	enabled = !enabled
+	a.subscriptionEnabled[subscription.SubscriptionID] = enabled
+	node.SetText(subscriptionLabel(subscription.Name, enabled))
+
+	if !enabled {
+		node.ClearChildren()
+		node.SetExpanded(false)
+		if a.activePane == paneAccounts {
+			a.updateDetails(subscription)
+		}
+		a.showEmptyContents("Subscription disabled.")
+		return
+	}
+
+	if err := a.loadAccountsForSubscription(node, subscription); err != nil {
+		a.showTreeLoadError("accounts", err)
+		errorRef := itemRef{
+			Kind:             kindNone,
+			Name:             "Error loading accounts.",
+			SubscriptionID:   subscription.SubscriptionID,
+			SubscriptionName: subscription.SubscriptionName,
+		}
+		node.ClearChildren()
+		node.AddChild(tview.NewTreeNode(errorRef.Name).SetReference(errorRef).SetSelectable(true))
+		return
+	}
+
+	node.SetExpanded(true)
+	if a.activePane == paneAccounts {
+		a.updateDetails(subscription)
+	}
+	a.showEmptyContents("Select an account to view containers.")
+}
+
+func (a *App) loadAccountsForSubscription(node *tview.TreeNode, subscription itemRef) error {
+	ctx := context.Background()
+	accounts, err := a.provider.ListAccounts(ctx, subscription.SubscriptionID)
+	if err != nil {
+		return err
+	}
+
+	node.ClearChildren()
+	if len(accounts) == 0 {
+		ref := itemRef{
+			Kind:             kindNone,
+			Name:             "No accounts.",
+			SubscriptionID:   subscription.SubscriptionID,
+			SubscriptionName: subscription.SubscriptionName,
+		}
+		child := tview.NewTreeNode(ref.Name).SetReference(ref).SetSelectable(true)
+		node.AddChild(child)
+		return nil
+	}
+
+	for _, account := range accounts {
+		ref := itemRef{
+			Kind:             kindAccount,
+			Name:             account.Name,
+			SubscriptionID:   subscription.SubscriptionID,
+			SubscriptionName: subscription.SubscriptionName,
+			Account:          account.Name,
+			Region:           account.Region,
+		}
+		child := tview.NewTreeNode(account.Name).SetReference(ref).SetSelectable(true)
+		node.AddChild(child)
+	}
 
 	return nil
 }
@@ -351,7 +500,13 @@ func (a *App) loadContainers(node *tview.TreeNode, account itemRef) error {
 	}
 
 	if len(containers) == 0 {
-		ref := itemRef{Kind: kindNone, Name: "No containers.", Account: account.Account}
+		ref := itemRef{
+			Kind:             kindNone,
+			Name:             "No containers.",
+			SubscriptionID:   account.SubscriptionID,
+			SubscriptionName: account.SubscriptionName,
+			Account:          account.Account,
+		}
 		child := tview.NewTreeNode(ref.Name).SetReference(ref).SetSelectable(true)
 		node.AddChild(child)
 		return nil
@@ -359,11 +514,13 @@ func (a *App) loadContainers(node *tview.TreeNode, account itemRef) error {
 
 	for _, container := range containers {
 		ref := itemRef{
-			Kind:         kindContainer,
-			Name:         container.Name,
-			Account:      account.Account,
-			Container:    container.Name,
-			PublicAccess: container.PublicAccess,
+			Kind:             kindContainer,
+			Name:             container.Name,
+			SubscriptionID:   account.SubscriptionID,
+			SubscriptionName: account.SubscriptionName,
+			Account:          account.Account,
+			Container:        container.Name,
+			PublicAccess:     container.PublicAccess,
 		}
 		child := tview.NewTreeNode(container.Name).SetReference(ref).SetSelectable(true)
 		node.AddChild(child)
@@ -380,7 +537,14 @@ func (a *App) loadBlobChildren(node *tview.TreeNode, container itemRef) error {
 	}
 
 	if len(blobs) == 0 {
-		ref := itemRef{Kind: kindNone, Name: "No blobs.", Account: container.Account, Container: container.Container}
+		ref := itemRef{
+			Kind:             kindNone,
+			Name:             "No blobs.",
+			SubscriptionID:   container.SubscriptionID,
+			SubscriptionName: container.SubscriptionName,
+			Account:          container.Account,
+			Container:        container.Container,
+		}
 		child := tview.NewTreeNode(ref.Name).SetReference(ref).SetSelectable(true)
 		node.AddChild(child)
 		return nil
@@ -388,13 +552,15 @@ func (a *App) loadBlobChildren(node *tview.TreeNode, container itemRef) error {
 
 	for _, blob := range blobs {
 		ref := itemRef{
-			Kind:        kindBlob,
-			Name:        blob.Name,
-			Account:     container.Account,
-			Container:   container.Container,
-			SizeBytes:   blob.SizeBytes,
-			Modified:    blob.Modified,
-			ContentType: blob.ContentType,
+			Kind:             kindBlob,
+			Name:             blob.Name,
+			SubscriptionID:   container.SubscriptionID,
+			SubscriptionName: container.SubscriptionName,
+			Account:          container.Account,
+			Container:        container.Container,
+			SizeBytes:        blob.SizeBytes,
+			Modified:         blob.Modified,
+			ContentType:      blob.ContentType,
 		}
 		child := tview.NewTreeNode(blob.Name).SetReference(ref).SetSelectable(true)
 		node.AddChild(child)
@@ -413,6 +579,16 @@ func (a *App) expandTreeNode(node *tview.TreeNode, toggle bool) {
 	}
 
 	switch ref.Kind {
+	case kindSubscription:
+		if !a.isSubscriptionEnabled(ref.SubscriptionID) {
+			return
+		}
+		if len(node.GetChildren()) == 0 {
+			if err := a.loadAccountsForSubscription(node, ref); err != nil {
+				a.showTreeLoadError("accounts", err)
+				return
+			}
+		}
 	case kindAccount:
 		if len(node.GetChildren()) == 0 {
 			if err := a.loadContainers(node, ref); err != nil {
@@ -438,6 +614,25 @@ func (a *App) expandTreeNode(node *tview.TreeNode, toggle bool) {
 	}
 }
 
+func (a *App) parentNode(target *tview.TreeNode) *tview.TreeNode {
+	if target == nil || target == a.root || a.root == nil {
+		return nil
+	}
+	return a.findParentNode(target, a.root, nil)
+}
+
+func (a *App) findParentNode(target, node, parent *tview.TreeNode) *tview.TreeNode {
+	if node == target {
+		return parent
+	}
+	for _, child := range node.GetChildren() {
+		if found := a.findParentNode(target, child, node); found != nil {
+			return found
+		}
+	}
+	return nil
+}
+
 func (a *App) onTreeChanged(node *tview.TreeNode) {
 	if node == nil {
 		return
@@ -457,8 +652,14 @@ func (a *App) onTreeChanged(node *tview.TreeNode) {
 		a.updatePreview(ref)
 	case kindAccount:
 		a.showEmptyContents("Select a container to view blobs.")
+	case kindSubscription:
+		if a.isSubscriptionEnabled(ref.SubscriptionID) {
+			a.showEmptyContents("Select an account to view containers.")
+		} else {
+			a.showEmptyContents("Subscription disabled.")
+		}
 	case kindRoot:
-		a.showEmptyContents("Select an account to view containers.")
+		a.showEmptyContents("Select a subscription to view accounts.")
 	case kindNone:
 		a.showEmptyContents(ref.Name)
 	}
@@ -478,6 +679,8 @@ func (a *App) onTreeSelected(node *tview.TreeNode) {
 	}
 
 	switch ref.Kind {
+	case kindSubscription:
+		a.expandTreeNode(node, true)
 	case kindAccount:
 		a.expandTreeNode(node, true)
 	case kindContainer:
@@ -507,19 +710,28 @@ func (a *App) showBlobs(container itemRef) error {
 
 	for _, blob := range blobs {
 		ref := itemRef{
-			Kind:        kindBlob,
-			Name:        blob.Name,
-			Account:     container.Account,
-			Container:   container.Container,
-			SizeBytes:   blob.SizeBytes,
-			Modified:    blob.Modified,
-			ContentType: blob.ContentType,
+			Kind:             kindBlob,
+			Name:             blob.Name,
+			SubscriptionID:   container.SubscriptionID,
+			SubscriptionName: container.SubscriptionName,
+			Account:          container.Account,
+			Container:        container.Container,
+			SizeBytes:        blob.SizeBytes,
+			Modified:         blob.Modified,
+			ContentType:      blob.ContentType,
 		}
 		a.addContentRow(ref, blob.Name, formatContentDetails(ref))
 	}
 
 	if len(blobs) == 0 {
-		ref := itemRef{Kind: kindNone, Name: "No blobs in container.", Account: container.Account, Container: container.Container}
+		ref := itemRef{
+			Kind:             kindNone,
+			Name:             "No blobs in container.",
+			SubscriptionID:   container.SubscriptionID,
+			SubscriptionName: container.SubscriptionName,
+			Account:          container.Account,
+			Container:        container.Container,
+		}
 		a.addContentRow(ref, ref.Name, "")
 	}
 
@@ -608,15 +820,15 @@ func (a *App) showLoadError(scope string, err error) {
 	a.contents.SetTitle("Contents")
 }
 
-func (a *App) showAccountsError(err error) {
-	a.loadingAccounts = true
+func (a *App) showSubscriptionsError(err error) {
+	a.loadingTree = true
 	a.root.ClearChildren()
-	ref := itemRef{Kind: kindNone, Name: "Error loading accounts."}
+	ref := itemRef{Kind: kindNone, Name: "Error loading subscriptions."}
 	node := tview.NewTreeNode(ref.Name).SetReference(ref).SetSelectable(true)
 	a.root.AddChild(node)
 	a.accounts.SetCurrentNode(node)
-	a.loadingAccounts = false
-	a.showTreeLoadError("accounts", err)
+	a.loadingTree = false
+	a.showTreeLoadError("subscriptions", err)
 }
 
 func (a *App) showTreeLoadError(scope string, err error) {
@@ -629,23 +841,51 @@ func (a *App) updateDetails(ref itemRef) {
 	var text string
 	switch ref.Kind {
 	case kindRoot:
-		text = "Select an account to browse containers."
+		text = "Select a subscription to browse accounts."
 	case kindNone:
 		text = ref.Name
+	case kindSubscription:
+		status := "enabled"
+		if !a.isSubscriptionEnabled(ref.SubscriptionID) {
+			status = "disabled"
+		}
+		text = fmt.Sprintf("Subscription: %s\nStatus: %s", ref.Name, status)
 	case kindAccount:
-		text = fmt.Sprintf("Account: %s\nRegion: %s", ref.Name, ref.Region)
+		lines := []string{fmt.Sprintf("Account: %s", ref.Name)}
+		if ref.SubscriptionName != "" {
+			lines = append(lines, fmt.Sprintf("Subscription: %s", ref.SubscriptionName))
+		}
+		if ref.Region != "" {
+			lines = append(lines, fmt.Sprintf("Region: %s", ref.Region))
+		}
+		text = strings.Join(lines, "\n")
 	case kindContainer:
-		text = fmt.Sprintf("Container: %s\nAccount: %s\nPublic access: %s", ref.Name, ref.Account, ref.PublicAccess)
+		lines := []string{
+			fmt.Sprintf("Container: %s", ref.Name),
+			fmt.Sprintf("Account: %s", ref.Account),
+		}
+		if ref.SubscriptionName != "" {
+			lines = append(lines, fmt.Sprintf("Subscription: %s", ref.SubscriptionName))
+		}
+		if ref.PublicAccess != "" {
+			lines = append(lines, fmt.Sprintf("Public access: %s", ref.PublicAccess))
+		}
+		text = strings.Join(lines, "\n")
 	case kindBlob:
-		text = fmt.Sprintf(
-			"Blob: %s\nAccount: %s\nContainer: %s\nSize: %s\nModified: %s\nContent type: %s",
-			ref.Name,
-			ref.Account,
-			ref.Container,
-			formatBytes(ref.SizeBytes),
-			formatTime(ref.Modified),
-			ref.ContentType,
-		)
+		lines := []string{
+			fmt.Sprintf("Blob: %s", ref.Name),
+			fmt.Sprintf("Account: %s", ref.Account),
+			fmt.Sprintf("Container: %s", ref.Container),
+		}
+		if ref.SubscriptionName != "" {
+			lines = append(lines, fmt.Sprintf("Subscription: %s", ref.SubscriptionName))
+		}
+		lines = append(lines, fmt.Sprintf("Size: %s", formatBytes(ref.SizeBytes)))
+		lines = append(lines, fmt.Sprintf("Modified: %s", formatTime(ref.Modified)))
+		if ref.ContentType != "" {
+			lines = append(lines, fmt.Sprintf("Content type: %s", ref.ContentType))
+		}
+		text = strings.Join(lines, "\n")
 	default:
 		text = "No selection."
 	}

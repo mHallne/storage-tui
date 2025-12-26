@@ -7,9 +7,15 @@ import (
 
 // Provider defines storage listing operations used by the TUI.
 type Provider interface {
-	ListAccounts(ctx context.Context) ([]Account, error)
+	ListSubscriptions(ctx context.Context) ([]Subscription, error)
+	ListAccounts(ctx context.Context, subscriptionID string) ([]Account, error)
 	ListContainers(ctx context.Context, account string) ([]Container, error)
 	ListBlobs(ctx context.Context, account, container string) ([]Blob, error)
+}
+
+type Subscription struct {
+	ID   string
+	Name string
 }
 
 type Account struct {
@@ -31,16 +37,25 @@ type Blob struct {
 
 // MockProvider is a placeholder data source for UI development.
 type MockProvider struct {
-	accounts   []Account
-	containers map[string][]Container
-	blobs      map[string]map[string][]Blob
+	subscriptions []Subscription
+	accounts      map[string][]Account
+	containers    map[string][]Container
+	blobs         map[string]map[string][]Blob
 }
 
 func NewMockProvider() *MockProvider {
 	return &MockProvider{
-		accounts: []Account{
-			{Name: "acme-dev", Region: "westeurope"},
-			{Name: "acme-prod", Region: "eastus"},
+		subscriptions: []Subscription{
+			{ID: "sub-dev", Name: "Development"},
+			{ID: "sub-prod", Name: "Production"},
+		},
+		accounts: map[string][]Account{
+			"sub-dev": {
+				{Name: "acme-dev", Region: "westeurope"},
+			},
+			"sub-prod": {
+				{Name: "acme-prod", Region: "eastus"},
+			},
 		},
 		containers: map[string][]Container{
 			"acme-dev": {
@@ -76,9 +91,22 @@ func NewMockProvider() *MockProvider {
 	}
 }
 
-func (m *MockProvider) ListAccounts(ctx context.Context) ([]Account, error) {
+func (m *MockProvider) ListSubscriptions(ctx context.Context) ([]Subscription, error) {
 	_ = ctx
-	return append([]Account(nil), m.accounts...), nil
+	return append([]Subscription(nil), m.subscriptions...), nil
+}
+
+func (m *MockProvider) ListAccounts(ctx context.Context, subscriptionID string) ([]Account, error) {
+	_ = ctx
+	if subscriptionID == "" {
+		var all []Account
+		for _, accounts := range m.accounts {
+			all = append(all, accounts...)
+		}
+		return append([]Account(nil), all...), nil
+	}
+	accounts := m.accounts[subscriptionID]
+	return append([]Account(nil), accounts...), nil
 }
 
 func (m *MockProvider) ListContainers(ctx context.Context, account string) ([]Container, error) {
