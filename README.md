@@ -13,8 +13,8 @@ go run ./cmd/storage-tui
 - q: quit
 - r: refresh data
 - tab: cycle focus between accounts, contents, and preview
-- enter: expand or collapse account or container
-- right arrow: expand account or container
+- enter/right arrow: expand or collapse account or container
+- space: toggle subscription selection
 - /: search within preview
 - esc: clear preview search
 
